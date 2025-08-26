@@ -79,6 +79,8 @@ class RouterWidget:
         self.connections: List[Endpoint] = list(connections) if connections else []
         self.protocol: str = protocol
 
+        self._selected_keys: set[str] = set()
+
         self.log_queue: "queue.Queue[str]" = queue.Queue()
         # Router logs go to the queue; UI timer flushes them into textarea
         self.router = Router(
@@ -127,20 +129,22 @@ class RouterWidget:
 
             # --- Connections section ---
             ui.label(text='Connections').classes('text-md font-medium')
-            # Table of current connections
+            # Table of current connections (multi-select)
             self.conn_table = ui.table(
                 columns=[
                     {"name": "ip", "label": "IP Address", "field": "ip", "align": "left"},
                     {"name": "port", "label": "Port", "field": "port", "align": "left"},
                 ],
-                rows=[{"ip": c.ip_address, "port": c.port} for c in self.connections],
-                row_key='ip'
-            ).classes('w-full').style('max-height: 220px; overflow:auto;')
+                rows=self._rows_from_connections(),
+                row_key='key',
+            ).props('selection="multiple"').classes('w-full').style('max-height: 220px; overflow:auto;')
+            self.conn_table.on('selection', self.on_table_selection)
 
             with ui.row().classes('items-center gap-3 mt-2'):
                 self.new_ip_input = ui.input(label='IP', value='').props('outlined dense').classes('w-[14rem]')
                 self.new_port_input = ui.input(label='Port', value='').props('outlined dense').classes('w-[8rem]')
                 ui.button(text='+ Add', on_click=self.on_add_connection).props('push color=secondary')
+                ui.button(text='Remove Selected', on_click=self.on_remove_selected).props('push color=negative outline')
 
             ui.separator()
 
@@ -227,17 +231,12 @@ class RouterWidget:
                 return
         new_ep = Endpoint(ip_address=ip, port=port)
         self.connections.append(new_ep)
-        # Update Router instance too
         try:
             self.router.add_connection(new_ep)
         except Exception:
-            # Fallback if method not available
             pass
-        # Refresh table
-        self.conn_table.rows = [{"ip": c.ip_address, "port": c.port} for c in self.connections]
-        self.conn_table.update()
+        self._refresh_table()
         self.log_queue.put(f'Added connection {ip}:{port}.')
-        # Clear inputs
         self.new_ip_input.value = ''
         self.new_port_input.value = ''
 
@@ -268,6 +267,67 @@ class RouterWidget:
                 self.log_area.value = (self.log_area.value + line + '\n').lstrip()
                 updated = True
         # No auto-scroll; fixed-size container is scrollable
+
+    # ---------- Connections helpers ----------
+    def _rows_from_connections(self) -> list[dict]:
+        return [
+            {"key": f"{c.ip_address}:{c.port}", "ip": c.ip_address, "port": c.port}
+            for c in self.connections
+        ]
+
+    def _refresh_table(self) -> None:
+        self.conn_table.rows = self._rows_from_connections()
+        self.conn_table.update()
+
+  
+    def on_table_selection(self, e) -> None:
+        # NiceGUI's table selection event may pass either a list of row dicts
+        # or a list of row keys depending on version; handle both robustly.
+        selected = getattr(e, 'args', [])
+        keys: set[str] = set()
+        for item in (selected or []):
+            if isinstance(item, dict):
+                key = item.get('key')
+                if not key:
+                    ip = item.get('ip')
+                    port = item.get('port')
+                    if ip is not None and port is not None:
+                        key = f'{ip}:{port}'
+                if key:
+                    keys.add(str(key))
+            else:
+                # assume row_key was emitted directly
+                keys.add(str(item))
+        self._selected_keys = keys
+
+
+    def on_remove_selected(self) -> None:
+        if not self._selected_keys:
+            self.log_queue.put('No connections selected to remove.')
+            return
+        to_remove: List[Endpoint] = []
+        remaining: List[Endpoint] = []
+        for c in self.connections:
+            key = f"{c.ip_address}:{c.port}"
+            if key in self._selected_keys:
+                to_remove.append(c)
+            else:
+                remaining.append(c)
+        if to_remove:
+            # Update widget state
+            self.connections = remaining
+            # Update Router
+            try:
+                self.router.remove_connection(to_remove)
+            except Exception:
+                pass
+            self._refresh_table()
+            self._selected_keys.clear()
+            removed_str = ', '.join(f"{e.ip_address}:{e.port}" for e in to_remove)
+            self.log_queue.put(f'Removed: {removed_str}')
+        else:
+            self.log_queue.put('Nothing matched selection to remove.')
+
 
 # =========================
 # Page assembly
