@@ -11,6 +11,7 @@ sys.path.append(repo_dir)
 
 from network.helper.helper import Endpoint, send_message
 
+
 class Router:
     """
     A simple router that listens on one endpoint and forwards received messages
@@ -47,13 +48,18 @@ class Router:
         return self._is_running
 
     # Optional mutators if you want to manage connections at runtime
-    def add_connection(self, endpoint: Endpoint) -> None:
+    def add_connections(self, endpoints: List[Endpoint]) -> None:
 
-        self.connections.append(endpoint)
+        # Don't add connections that already exist, and don't add yourself.
+        new_endpoints = [endpoint for endpoint in endpoints if (endpoint not in self.connections) and (endpoint != self.endpoint)]
+        if len(new_endpoints) != len(endpoints):
+            self._log(f'Ignoring attempt to connect self or duplicate endpoint.')
+        
+        self.connections.extend(new_endpoints)
 
         return
 
-    def remove_connection(self, endpoints: List[Endpoint]) -> None:
+    def remove_connections(self, endpoints: List[Endpoint]) -> None:
 
         self.connections = [e for e in self.connections if e not in endpoints]
 

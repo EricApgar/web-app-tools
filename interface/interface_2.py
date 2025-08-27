@@ -75,29 +75,24 @@ class RouterWidget:
         connections: Optional[List[Endpoint]] = None,
         protocol: str = 'TCP'
     ) -> None:
-        self.endpoint: Endpoint = endpoint
-        self.connections: List[Endpoint] = list(connections) if connections else []
         self.protocol: str = protocol
-
-        self._selected_keys: set[str] = set()
+        self._selected_connections: set[str] = set()
 
         self.log_queue: "queue.Queue[str]" = queue.Queue()
         # Router logs go to the queue; UI timer flushes them into textarea
         self.router = Router(
-            endpoint=self.endpoint,
-            connections=self.connections,
+            endpoint=endpoint,
+            connections=list(connections) if connections else [],
             on_log=self.log_queue.put
         )
 
         with ui.card().classes('w-[40rem]'):
             ui.label(text='Router Service').classes('text-lg font-medium')
             with ui.row().classes('items-center gap-4'):
-                # Display immutable host IP
-                ui.label(text=f'Host IP: {self.endpoint.ip_address}')
-                # Editable port field; changes require restart if running
+                ui.label(text=f'Host IP: {self.router.endpoint.ip_address}')
                 self.port_input = ui.input(
                     label='Port',
-                    value=str(self.endpoint.port),
+                    value=str(self.router.endpoint.port),
                     on_change=self.on_port_change
                 ).props('outlined dense').classes('w-[8rem]')
                 self.protocol_select = ui.select(
@@ -129,7 +124,6 @@ class RouterWidget:
 
             # --- Connections section ---
             ui.label(text='Connections').classes('text-md font-medium')
-            # Table of current connections (multi-select)
             self.conn_table = ui.table(
                 columns=[
                     {"name": "ip", "label": "IP Address", "field": "ip", "align": "left"},
@@ -148,14 +142,12 @@ class RouterWidget:
 
             ui.separator()
 
-            # Fixed-height, scrollable log output
             self.log_area = ui.textarea(
                 label='Router Logs',
                 value='',
                 placeholder='Router logs will appear here…'
             ).props('readonly').classes('w-full').style('height: 220px; overflow:auto;')
 
-        # Periodically flush logs from the queue to the textarea (UI thread)
         self.log_timer = ui.timer(
             interval=0.2,
             callback=self.flush_logs,
@@ -179,7 +171,6 @@ class RouterWidget:
             return
         if selected == self.protocol:
             return
-        # Update current protocol; if running, restart to apply
         self.protocol = selected
         if self.router.running:
             self.router.stop()
@@ -194,16 +185,12 @@ class RouterWidget:
             if not (1 <= new_port <= 65535):
                 raise ValueError('port out of range')
         except Exception:
-            # Revert and notify
-            self.port_input.value = str(self.endpoint.port)
+            self.port_input.value = str(self.router.endpoint.port)
             self.log_queue.put('Invalid port. Enter an integer 1–65535.')
             return
-        if new_port == self.endpoint.port:
+        if new_port == self.router.endpoint.port:
             return
-        # Apply new port; restart if running
-        self.endpoint = Endpoint(ip_address=self.endpoint.ip_address, port=new_port)
-        # Rebind the router's endpoint reference
-        self.router.endpoint = self.endpoint
+        self.router.endpoint = Endpoint(ip_address=self.router.endpoint.ip_address, port=new_port)
         self.log_queue.put(f'Port set to {new_port}.')
         if self.router.running:
             self.router.stop()
@@ -217,6 +204,7 @@ class RouterWidget:
         if not ip or not port_raw:
             self.log_queue.put('Both IP and Port are required to add a connection.')
             return
+
         try:
             port = int(port_raw)
             if not (1 <= port <= 65535):
@@ -224,21 +212,23 @@ class RouterWidget:
         except Exception:
             self.log_queue.put('Port must be an integer 1–65535.')
             return
-        # Prevent duplicates
-        for c in self.connections:
-            if c.ip_address == ip and c.port == port:
-                self.log_queue.put(f'Connection {ip}:{port} already exists.')
-                return
-        new_ep = Endpoint(ip_address=ip, port=port)
-        self.connections.append(new_ep)
-        try:
-            self.router.add_connection(new_ep)
-        except Exception:
-            pass
+        
+        new_connection = Endpoint(ip_address=ip, port=port)
+
+        if new_connection in self.router.connections:
+            self.log_queue.put(f'Connection {ip}:{port} already exists.')
+            return
+        elif new_connection == self.router.endpoint:
+            self.log_queue.put(f'Connection {ip}:{port} is self. Ignoring.')
+            return
+
+        self.router.add_connections(endpoints=[new_connection])
         self._refresh_table()
         self.log_queue.put(f'Added connection {ip}:{port}.')
         self.new_ip_input.value = ''
         self.new_port_input.value = ''
+
+        return
 
     def on_send_click(self) -> None:
         if not self.router.running:
@@ -247,7 +237,7 @@ class RouterWidget:
         try:
             send_message(
                 message=str(self.message_input.value),
-                endpoint=self.endpoint,
+                endpoint=self.router.endpoint,
                 protocol=self.protocol,
                 timeout_seconds=2.0,
                 encoding='utf-8'
@@ -255,6 +245,8 @@ class RouterWidget:
             self.log_queue.put(f"UI: Sent -> {self.message_input.value}")
         except Exception as exc:
             self.log_queue.put(f"UI: Send failed -> {exc!r}")
+
+        return
 
     def flush_logs(self) -> None:
         updated: bool = False
@@ -268,65 +260,50 @@ class RouterWidget:
                 updated = True
         # No auto-scroll; fixed-size container is scrollable
 
-    # ---------- Connections helpers ----------
+        return
+
     def _rows_from_connections(self) -> list[dict]:
         return [
             {"key": f"{c.ip_address}:{c.port}", "ip": c.ip_address, "port": c.port}
-            for c in self.connections
+            for c in self.router.connections
         ]
+    
+        return
+
 
     def _refresh_table(self) -> None:
+
         self.conn_table.rows = self._rows_from_connections()
         self.conn_table.update()
 
-  
+        return
+
+
     def on_table_selection(self, e) -> None:
-        # NiceGUI's table selection event may pass either a list of row dicts
-        # or a list of row keys depending on version; handle both robustly.
+
         selected = getattr(e, 'args', [])
-        keys: set[str] = set()
-        for item in (selected or []):
-            if isinstance(item, dict):
-                key = item.get('key')
-                if not key:
-                    ip = item.get('ip')
-                    port = item.get('port')
-                    if ip is not None and port is not None:
-                        key = f'{ip}:{port}'
-                if key:
-                    keys.add(str(key))
-            else:
-                # assume row_key was emitted directly
-                keys.add(str(item))
-        self._selected_keys = keys
+        self._selected_connections = [Endpoint(ip_address=i['ip'], port=i['port']) for i in selected['rows']]
+
+        return
 
 
     def on_remove_selected(self) -> None:
-        if not self._selected_keys:
+        '''
+        Remove selected endpoints from Router.
+        '''
+
+        if not self._selected_connections:
             self.log_queue.put('No connections selected to remove.')
             return
-        to_remove: List[Endpoint] = []
-        remaining: List[Endpoint] = []
-        for c in self.connections:
-            key = f"{c.ip_address}:{c.port}"
-            if key in self._selected_keys:
-                to_remove.append(c)
-            else:
-                remaining.append(c)
-        if to_remove:
-            # Update widget state
-            self.connections = remaining
-            # Update Router
-            try:
-                self.router.remove_connection(to_remove)
-            except Exception:
-                pass
-            self._refresh_table()
-            self._selected_keys.clear()
-            removed_str = ', '.join(f"{e.ip_address}:{e.port}" for e in to_remove)
-            self.log_queue.put(f'Removed: {removed_str}')
-        else:
-            self.log_queue.put('Nothing matched selection to remove.')
+
+        self.router.remove_connections(self._selected_connections)
+
+        self._refresh_table()
+        removed_str = ', '.join(f"{e.ip_address}:{e.port}" for e in self._selected_connections)
+        self._selected_connections.clear()
+        self.log_queue.put(f'Removed: {removed_str}')
+
+        return
 
 
 # =========================
@@ -340,11 +317,8 @@ with ui.row().classes('gap-6'):
 with ui.row().classes('gap-6'):
     RouterWidget(
         endpoint=Endpoint(ip_address='127.0.0.1', port=8000),
-        connections=[],     # you can add Endpoint(...)s here later
+        connections=[],
         protocol='TCP'
     )
 
-ui.run(
-    title='Network Control',
-    reload=False
-)
+ui.run(title='Network Control')  # reload=False
